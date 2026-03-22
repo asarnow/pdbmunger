@@ -32,28 +32,83 @@ AA3 = {
 _TRAILER_RECORDS = frozenset({"ANISOU", "ENDMDL", "END", "CONECT", "MASTER"})
 
 
-def _sort_residues(df):
+def _sort_residues(df, chain_ids=None):
     """Sort residue entries by residue number within each chain, preserving original
-    chain order and atom order within each residue."""
-    chain_order = df["chain_id"].unique()  # first-occurrence order
-    df = df.copy()
-    df["chain_id"] = pd.Categorical(df["chain_id"], categories=chain_order, ordered=True)
-    df = df.sort_values(["chain_id", "residue_number", "atom_number"]).reset_index(drop=True)
-    df["chain_id"] = df["chain_id"].astype(str)
-    return df
+    chain order and atom order within each residue.
+    If chain_ids is given, only sort those chains; others are left in place."""
+    chain_order = df["chain_id"].unique()
+    parts = []
+    for cid in chain_order:
+        sub = df[df["chain_id"] == cid].copy()
+        if chain_ids is None or cid in chain_ids:
+            sub = sub.sort_values(["residue_number", "atom_number"])
+        parts.append(sub)
+    return pd.concat(parts).reset_index(drop=True)
 
 
-def _renumber_residues(df, start):
+def _renumber_residues(df, start, chain_ids=None):
     """Renumber residues in df per chain sequentially from start.
-    Each chain is numbered independently. Insertion codes are cleared."""
+    If chain_ids is given, only renumber those chains.
+    Insertion codes are cleared for modified chains."""
     df = df.copy()
     for chain_id in df["chain_id"].unique():
+        if chain_ids is not None and chain_id not in chain_ids:
+            continue
         mask = df["chain_id"] == chain_id
         old_nums = list(dict.fromkeys(df.loc[mask, "residue_number"]))
         mapping = {old: new for new, old in enumerate(old_nums, start=start)}
         df.loc[mask, "residue_number"] = df.loc[mask, "residue_number"].map(mapping)
-    df["insertion"] = ""
+        df.loc[mask, "insertion"] = ""
     return df
+
+
+def _get_target_chains(pdb, chain_opt):
+    """Return set of ATOM chain IDs to operate on, or None for all chains.
+
+    Uses amino3to1 to build per-chain sequences for identity comparison.
+    - No chain_opt and all ATOM chains identical: return all chain IDs.
+    - No chain_opt and multiple distinct groups: return None (apply to all).
+    - chain_opt given: expand each specified chain to all ATOM chains with the
+      same sequence; include specified chains not found in ATOM (HETATM-only).
+    """
+    seq_df = pdb.amino3to1(record="ATOM", residue_col="residue_name", fillna="?")
+    sequences = seq_df.groupby("chain_id", sort=False)["residue_name"].apply("".join).to_dict()
+    if chain_opt is None:
+        if len(set(sequences.values())) == 1:
+            return set(sequences.keys())
+        return None
+    specified = {c.strip() for c in chain_opt.split(",")}
+    target = set()
+    for cid in specified:
+        if cid in sequences:
+            seq = sequences[cid]
+            target.update(c for c, s in sequences.items() if s == seq)
+        else:
+            target.add(cid)  # may be HETATM-only; handled separately
+    return target
+
+
+def _resolve_hetatm_collisions(hetatm_df, atom_df):
+    """Ensure HETATM residue numbers fall outside the ATOM residue range in mixed chains.
+
+    For each chain present in both ATOM and HETATM, if any HETATM residue number
+    falls within [min_atom_res, max_atom_res], renumber all HETATM residues for that
+    chain sequentially from max_atom_res + 1 (preserving their original order).
+    """
+    hetatm_df = hetatm_df.copy()
+    mixed_chains = set(hetatm_df["chain_id"]) & set(atom_df["chain_id"])
+    for chain_id in mixed_chains:
+        atom_mask = atom_df["chain_id"] == chain_id
+        hetatm_mask = hetatm_df["chain_id"] == chain_id
+        atom_min = atom_df.loc[atom_mask, "residue_number"].min()
+        atom_max = atom_df.loc[atom_mask, "residue_number"].max()
+        hetatm_res = hetatm_df.loc[hetatm_mask, "residue_number"]
+        if ((hetatm_res >= atom_min) & (hetatm_res <= atom_max)).any():
+            old_nums = list(dict.fromkeys(hetatm_df.loc[hetatm_mask, "residue_number"]))
+            mapping = {old: new for new, old in enumerate(old_nums, start=int(atom_max) + 1)}
+            hetatm_df.loc[hetatm_mask, "residue_number"] = (
+                hetatm_df.loc[hetatm_mask, "residue_number"].map(mapping))
+    return hetatm_df
 
 
 def _parse_fasta(path):
@@ -205,6 +260,13 @@ def print_info(pdb):
               is_flag=False, flag_value="1", default=None, metavar="N",
               help="Renumber residues per chain from N (default: 1); "
                    "prefix +/- to shift all residue numbers by N instead")
+@click.option("--renumber-hetatm-residues", "renumber_hetatm_residues",
+              is_flag=False, flag_value="1", default=None, metavar="N",
+              help="Renumber HETATM-only chain residues from N (requires --chain); "
+                   "same syntax as --renumber-residues")
+@click.option("--chain", "chain_opt", metavar="CHAINS",
+              help="Comma-separated chain IDs to scope operations to; "
+                   "automatically expanded to all chains with identical sequence")
 @click.option("--seqres", "seqres_fasta", metavar="FASTA", type=click.Path(exists=True),
               help="Set SEQRES records from a FASTA file (record names must be chain IDs)")
 @click.option("--bfactor", metavar="PDB",
@@ -212,27 +274,47 @@ def print_info(pdb):
 @click.option("--occupancy", metavar="VALUE",
               help="Set all occupancies to a single value")
 def main(input, output, renumber_atoms, sort_residues, renumber_residues,
-         seqres_fasta, bfactor, occupancy):
+         renumber_hetatm_residues, chain_opt, seqres_fasta, bfactor, occupancy):
     pdb = PandasPdb().read_pdb(input)
     if output is None:
         print_info(pdb)
         return 0
+    target_chains = _get_target_chains(pdb, chain_opt)
     if sort_residues:
-        atom = _sort_residues(pdb.df["ATOM"])
-        atom["atom_number"] = atom.index + 1
-        pdb.df["ATOM"] = atom
-        hetatm = _sort_residues(pdb.df["HETATM"])
-        hetatm["atom_number"] = hetatm.index + len(atom) + 1
-        pdb.df["HETATM"] = hetatm
+        pdb.df["ATOM"] = _sort_residues(pdb.df["ATOM"], chain_ids=target_chains)
+        pdb.df["HETATM"] = _sort_residues(pdb.df["HETATM"], chain_ids=target_chains)
+        pdb.df["ATOM"].loc[:, "atom_number"] = pdb.df["ATOM"].index.values + 1
+        pdb.df["HETATM"].loc[:, "atom_number"] = (pdb.df["HETATM"].index.values
+                                                  + len(pdb.df["ATOM"]) + 1)
     if renumber_residues is not None:
         if renumber_residues[0] in ("+", "-"):
             shift = int(renumber_residues)
-            pdb.df["ATOM"].loc[:, "residue_number"] += shift
-            pdb.df["HETATM"].loc[:, "residue_number"] += shift
+            if target_chains is None:
+                pdb.df["ATOM"].loc[:, "residue_number"] += shift
+            else:
+                mask = pdb.df["ATOM"]["chain_id"].isin(target_chains)
+                pdb.df["ATOM"].loc[mask, "residue_number"] += shift
         else:
             start = int(renumber_residues)
-            pdb.df["ATOM"] = _renumber_residues(pdb.df["ATOM"], start)
-            pdb.df["HETATM"] = _renumber_residues(pdb.df["HETATM"], start)
+            pdb.df["ATOM"] = _renumber_residues(pdb.df["ATOM"], start, chain_ids=target_chains)
+        pdb.df["HETATM"] = _resolve_hetatm_collisions(pdb.df["HETATM"], pdb.df["ATOM"])
+    if renumber_hetatm_residues is not None:
+        if chain_opt is None:
+            click.echo("Warning: --renumber-hetatm-residues has no effect without --chain",
+                       err=True)
+        else:
+            atom_chain_ids = set(pdb.df["ATOM"]["chain_id"].unique())
+            hetatm_chain_ids = set(pdb.df["HETATM"]["chain_id"].unique())
+            target_hetatm_only = (target_chains or set()) & (hetatm_chain_ids - atom_chain_ids)
+            if target_hetatm_only:
+                if renumber_hetatm_residues[0] in ("+", "-"):
+                    shift = int(renumber_hetatm_residues)
+                    mask = pdb.df["HETATM"]["chain_id"].isin(target_hetatm_only)
+                    pdb.df["HETATM"].loc[mask, "residue_number"] += shift
+                else:
+                    start = int(renumber_hetatm_residues)
+                    pdb.df["HETATM"] = _renumber_residues(pdb.df["HETATM"], start,
+                                                          chain_ids=target_hetatm_only)
     if renumber_atoms:
         pdb.df["ATOM"]["atom_number"] = pdb.df["ATOM"].index.values + 1
         pdb.df["HETATM"]["atom_number"] = (pdb.df["HETATM"].index.values
@@ -253,7 +335,8 @@ def main(input, output, renumber_atoms, sort_residues, renumber_residues,
             print("Updating %d heteroatoms" % bfactatoms.loc[hetatoms.index, "b_factor"].shape[0])
             hetatoms.loc[:, "b_factor"] = bfactatoms.loc[hetatoms.index, "b_factor"]
             pdb.df["HETATM"] = hetatoms.reset_index()[pdb.df["HETATM"].columns]
-    if sort_residues or seqres_fasta or renumber_atoms or renumber_residues is not None:
+    if (sort_residues or seqres_fasta or renumber_atoms
+            or renumber_residues is not None or renumber_hetatm_residues is not None):
         new_seqres = None
         if seqres_fasta:
             fasta_seqs = list(_parse_fasta(seqres_fasta).values())
@@ -270,4 +353,3 @@ def main(input, output, renumber_atoms, sort_residues, renumber_residues,
 
 if __name__ == "__main__":
     sys.exit(main(standalone_mode=False))
-
